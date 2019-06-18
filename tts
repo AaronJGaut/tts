@@ -1,5 +1,6 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import time
+import hashlib
 import math
 import sys
 import os
@@ -9,7 +10,7 @@ import argparse
 import io
 import warnings
 import threading
-import cPickle
+import pickle
 import glob
 
 import gtts
@@ -242,9 +243,9 @@ def main(infile, loop, text, cache, clear_cache):
 
     if cache:
         # Shift into positive range
-        curr_hash = hash(lines) + sys.maxsize + 1
-        umaxsize = 2 * (sys.maxsize + 1)
-        hex_digits = int(math.ceil(math.log(umaxsize, 16)))
+        hex_digits = 8
+        stripped_text = "\n".join(l.text for l in lines)
+        curr_hash= int(hashlib.md5(stripped_text.encode()).hexdigest()[:hex_digits], 16)
         hex_pattern = "{{:0{}x}}".format(hex_digits)
         while True:
             hex_hash = hex_pattern.format(curr_hash)
@@ -252,8 +253,8 @@ def main(infile, loop, text, cache, clear_cache):
                 [CACHE_DIR, CACHE_FILENAME_PATTERN.format(hex_hash)]
             )
             if os.path.exists(cache_path):
-                with open(cache_path) as f:
-                    cached_lines = cPickle.load(f)
+                with open(cache_path, 'r+b') as f:
+                    cached_lines = pickle.load(f)
                     if lines == cached_lines:
                         # Found existing match
                         lines = cached_lines
@@ -273,8 +274,8 @@ def main(infile, loop, text, cache, clear_cache):
             if line.status != line.STATUS_READY:
                 line.status = line.STATUS_FRESH
             line.error = None
-        with open(cache_path, "w") as f:
-            cPickle.dump(lines, f)
+        with open(cache_path, "w+b") as f:
+            pickle.dump(lines, f)
 
     return 0
 
