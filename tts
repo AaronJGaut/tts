@@ -247,7 +247,7 @@ def main(infile, loop, text, cache, clear_cache):
         hex_digits = int(math.ceil(math.log(umaxsize, 16)))
         hex_pattern = "{{:0{}x}}".format(hex_digits)
         while True:
-            hex_hash = hex_pattern.format(hash(curr_hash))
+            hex_hash = hex_pattern.format(curr_hash)
             cache_path = os.sep.join(
                 [CACHE_DIR, CACHE_FILENAME_PATTERN.format(hex_hash)]
             )
