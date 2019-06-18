@@ -1,0 +1,189 @@
+#!/usr/bin/env python
+import time
+import sys
+import tempfile
+import subprocess
+import argparse
+import io
+import warnings
+import threading
+
+import gtts
+
+# Removing bad substitution of M. to Monsieur
+gtts.tokenizer.symbols.SUB_PAIRS = []
+
+parser = argparse.ArgumentParser(
+    description="TTS program backed by Google TTS with an espeak fallback"
+)
+parser.add_argument("text", type=str, nargs="*")
+parser.add_argument(
+    "-f", "--file", type=str, help='Input file of text to read. "-" for stdin.'
+)
+parser.add_argument("-l", "--loop", action="store_true")
+
+args = parser.parse_args()
+
+if args.file:
+    if args.file == "-":
+        text = sys.stdin.read()
+    else:
+        with open(args.file) as f:
+            text = f.read()
+elif args.text:
+    text = " ".join(args.text)
+else:
+    text = sys.stdin.read()
+
+
+class Line(object):
+    STATUS_FREE = "STATUS_FREE"
+    STATUS_DISPATCHED = "STATUS_DISPATCHED"
+    STATUS_READY = "STATUS_READY"
+    STATUS_ERROR = "STATUS_ERROR"
+
+    def __init__(self, text):
+        self.text = text.strip()
+        self.status = self.STATUS_FREE
+        self.error = None
+        self.data = io.BytesIO()
+
+    def play(self):
+        if self.status != self.STATUS_READY:
+            raise RuntimeError(
+                'Tried to play not ready line "{}" with status "{}"'.format(
+                    self.text, self.status
+                )
+            )
+        self.data.seek(0)
+        with open("/dev/null") as devnull:
+            p = subprocess.Popen(
+                ["play", "-t", "mp3", "-"], stderr=devnull, stdin=subprocess.PIPE
+            )
+            p.stdin.write(self.data.getvalue())
+            p.stdin.close()
+            p.wait()
+
+    def play_fallback(self):
+        p = subprocess.Popen(["espeak"], stdin=subprocess.PIPE)
+        p.stdin.write(self.text)
+        p.stdin.close()
+        p.wait()
+
+    def convert(self):
+        try:
+            tts = gtts.gTTS(self.text)
+            tts.write_to_fp(self.data)
+            self.status = self.STATUS_READY
+        except Exception as e:
+            self.error = e
+            self.status = self.STATUS_ERROR
+            warnings.warn('Error "{}" when converting line "{}"'.format(e, self.text))
+
+
+lines = [Line(l) for l in text.split("\n") if l.strip()]
+
+
+class Worker(object):
+    def __init__(self, lines, thread_count=3, start_idx=0, loop=False):
+        self.__lines = lines
+        self.__reader_idx = start_idx
+        self.__lock = threading.Lock()
+        self.__has_been_closed = False
+        self.__t_producers = []
+        self.__loop = loop
+        for __ in range(thread_count):
+            t = threading.Thread(target=self.__produce)
+            self.__t_producers.append(t)
+        self.__t_consumer = threading.Thread(target=self.__consume)
+
+        for t in self.__t_producers:
+            t.start()
+        self.__t_consumer.start()
+
+    def block_until_done_reading(self):
+        while self.__t_consumer.isAlive():
+            time.sleep(0.1)
+
+    def close(self):
+        if self.__has_been_closed:
+            return
+        self.__has_been_closed = True
+        for t in self.__t_producers:
+            t.join()
+        self.__t_producers = []
+        self.__t_consumer.join()
+        self.__t_consumer = None
+
+    def __produce(self):
+        for line in self:
+            if self.__has_been_closed:
+                return
+            line.convert()
+
+    def __consume(self):
+        while True:
+            if self.__has_been_closed:
+                return
+            line = self.__lines[self.__reader_idx]
+            while line.status in [line.STATUS_FREE, line.STATUS_DISPATCHED]:
+                if self.__has_been_closed:
+                    return
+                time.sleep(0.1)
+            if line.status == line.STATUS_READY:
+                line.play()
+            elif line.status == line.STATUS_ERROR:
+                msg = 'Tried to play line "{}" with status "{}". The error was "{}". Falling back to espeak.'
+                warnings.warn(msg.format(line.text, line.status, line.error))
+                line.play_fallback()
+            else:
+                msg = (
+                    'Tried to play line "{}" w/ status "{}". This should never '
+                    "happen."
+                )
+                raise RuntimeError(msg.format(line.text, line.status))
+            self.__lock.acquire()
+            try:
+                self.__reader_idx += 1
+                if self.__reader_idx >= len(self.__lines):
+                    if self.__loop:
+                        self.__reader_idx = self.__reader_idx % len(self.__lines)
+                    else:
+                        return
+            finally:
+                self.__lock.release()
+
+    def set_reader_index(self, idx):
+        self.__lock.acquire()
+        try:
+            self.__reader_idx = idx
+        finally:
+            self.__lock.release()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.next()
+
+    def next(self):
+        self.__lock.acquire()
+        try:
+            line_order = (
+                self.__lines[self.__reader_idx :] + self.__lines[: self.__reader_idx]
+            )
+            for line in line_order:
+                if line.status == line.STATUS_FREE:
+                    line.status = line.STATUS_DISPATCHED
+                    return line
+            raise StopIteration
+        finally:
+            self.__lock.release()
+
+    def __del__(self):
+        self.close()
+
+
+worker = Worker(lines, loop=args.loop)
+worker.block_until_done_reading()
+worker.close()
