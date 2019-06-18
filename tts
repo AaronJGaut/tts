@@ -1,39 +1,51 @@
 #!/usr/bin/env python
 import time
+import math
 import sys
+import os
 import tempfile
 import subprocess
 import argparse
 import io
 import warnings
 import threading
+import cPickle
+import glob
 
 import gtts
 
 # Removing bad substitution of M. to Monsieur
 gtts.tokenizer.symbols.SUB_PAIRS = []
+CACHE_WARNING_SIZE = 1e9  # 1 GB
+CACHE_DIR = os.sep.join([os.getenv("HOME", None), ".cache", "tts"])
+CACHE_FILENAME_PATTERN = "tts_cache_{}.pickle"
 
-parser = argparse.ArgumentParser(
-    description="TTS program backed by Google TTS with an espeak fallback"
-)
-parser.add_argument("text", type=str, nargs="*")
-parser.add_argument(
-    "-f", "--file", type=str, help='Input file of text to read. "-" for stdin.'
-)
-parser.add_argument("-l", "--loop", action="store_true")
 
-args = parser.parse_args()
+def human_filesize(bytes_):
+    units = ["bytes", "kB", "MB", "GB", "TB", "PB"]
+    power = 0
+    for power, unit in enumerate(units):
+        if bytes_ < 1024 ** (power + 1):
+            break
+    if power == 0:
+        return "{} bytes".format(bytes_)
+    return "{:.2f} {}".format(bytes_ / 1024.0 ** power, unit)
 
-if args.file:
-    if args.file == "-":
-        text = sys.stdin.read()
-    else:
-        with open(args.file) as f:
-            text = f.read()
-elif args.text:
-    text = " ".join(args.text)
-else:
-    text = sys.stdin.read()
+
+def add_arguments(parser):
+    parser.add_argument("text", type=str, nargs="*")
+    parser.add_argument(
+        "-f",
+        "--file",
+        dest="infile",
+        type=str,
+        help='Input file of text to read. "-" for stdin.',
+    )
+    parser.add_argument("-l", "--loop", action="store_true")
+    parser.add_argument("--no-cache", dest="cache", action="store_false")
+    parser.add_argument("--clear-cache", action="store_true")
+
+    return parser
 
 
 class Line(object):
@@ -42,11 +54,17 @@ class Line(object):
     STATUS_READY = "STATUS_READY"
     STATUS_ERROR = "STATUS_ERROR"
 
+    def __eq__(self, other):
+        return self.text == other.text
+
     def __init__(self, text):
         self.text = text.strip()
         self.status = self.STATUS_FREE
         self.error = None
-        self.data = io.BytesIO()
+        self.mp3bytes = None
+
+    def __hash__(self):
+        return hash(self.text)
 
     def play(self):
         if self.status != self.STATUS_READY:
@@ -55,12 +73,11 @@ class Line(object):
                     self.text, self.status
                 )
             )
-        self.data.seek(0)
         with open("/dev/null") as devnull:
             p = subprocess.Popen(
                 ["play", "-t", "mp3", "-"], stderr=devnull, stdin=subprocess.PIPE
             )
-            p.stdin.write(self.data.getvalue())
+            p.stdin.write(self.mp3bytes)
             p.stdin.close()
             p.wait()
 
@@ -73,15 +90,15 @@ class Line(object):
     def convert(self):
         try:
             tts = gtts.gTTS(self.text)
-            tts.write_to_fp(self.data)
+            data = io.BytesIO()
+            tts.write_to_fp(data)
+            data.seek(0)
+            self.mp3bytes = data.getvalue()
             self.status = self.STATUS_READY
         except Exception as e:
             self.error = e
             self.status = self.STATUS_ERROR
             warnings.warn('Error "{}" when converting line "{}"'.format(e, self.text))
-
-
-lines = [Line(l) for l in text.split("\n") if l.strip()]
 
 
 class Worker(object):
@@ -133,7 +150,10 @@ class Worker(object):
             if line.status == line.STATUS_READY:
                 line.play()
             elif line.status == line.STATUS_ERROR:
-                msg = 'Tried to play line "{}" with status "{}". The error was "{}". Falling back to espeak.'
+                msg = (
+                    'Tried to play line "{}" with status "{}". The error was "{}". '
+                    "Falling back to espeak."
+                )
                 warnings.warn(msg.format(line.text, line.status, line.error))
                 line.play_fallback()
             else:
@@ -184,6 +204,85 @@ class Worker(object):
         self.close()
 
 
-worker = Worker(lines, loop=args.loop)
-worker.block_until_done_reading()
-worker.close()
+def main(infile, loop, text, cache, clear_cache):
+    if infile:
+        if infile == "-":
+            all_text = sys.stdin.read()
+        else:
+            with open(infile) as f:
+                all_text = f.read()
+    else:
+        all_text = " ".join(text)
+
+    if os.path.exists(CACHE_DIR):
+        glob_pattern = os.path.sep.join([CACHE_DIR, CACHE_FILENAME_PATTERN.format("*")])
+        cache_paths = glob.glob(glob_pattern)
+        if clear_cache:
+            for path in cache_paths:
+                os.remove(path)
+        else:
+            total_bytes = sum(os.path.getsize(path) for path in cache_paths)
+            if total_bytes > CACHE_WARNING_SIZE:
+                msg_fmt = (
+                    'Total size of tts cache at path "{}" has size {}, exceeding '
+                    "the warning limit of {}. Run tts --clear-cache to delete all "
+                    "cached files."
+                )
+                msg = msg_fmt.format(
+                    CACHE_DIR,
+                    human_filesize(total_bytes),
+                    human_filesize(CACHE_WARNING_SIZE),
+                )
+                warnings.warn(msg)
+
+    lines = tuple(Line(l) for l in all_text.split("\n") if l.strip())
+
+    if not lines:
+        return 0
+
+    if cache:
+        # Shift into positive range
+        curr_hash = hash(lines) + sys.maxsize + 1
+        umaxsize = 2 * (sys.maxsize + 1)
+        hex_digits = int(math.ceil(math.log(umaxsize, 16)))
+        hex_pattern = "{{:0{}x}}".format(hex_digits)
+        while True:
+            hex_hash = hex_pattern.format(hash(curr_hash))
+            cache_path = os.sep.join(
+                [CACHE_DIR, CACHE_FILENAME_PATTERN.format(hex_hash)]
+            )
+            if os.path.exists(cache_path):
+                with open(cache_path) as f:
+                    cached_lines = cPickle.load(f)
+                    if lines == cached_lines:
+                        # Found existing match
+                        lines = cached_lines
+                        break
+                    else:
+                        # Hash collision
+                        curr_hash += 1
+            else:
+                break
+
+    worker = Worker(lines, loop=loop)
+    worker.block_until_done_reading()
+    worker.close()
+    if cache:
+        subprocess.call(["mkdir", "-p", CACHE_DIR])
+        for line in lines:
+            if line.status != line.STATUS_READY:
+                line.status = line.STATUS_FRESH
+            line.error = None
+        with open(cache_path, "w") as f:
+            cPickle.dump(lines, f)
+
+    return 0
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="TTS program backed by Google TTS with an espeak fallback"
+    )
+    add_arguments(parser)
+    args = parser.parse_args()
+    sys.exit(main(**args.__dict__))
