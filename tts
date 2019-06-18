@@ -14,6 +14,7 @@ import pickle
 import glob
 
 import gtts
+import pyperclip
 
 # Removing bad substitution of M. to Monsieur
 gtts.tokenizer.symbols.SUB_PAIRS = []
@@ -34,14 +35,16 @@ def human_filesize(bytes_):
 
 
 def add_arguments(parser):
-    parser.add_argument("text", type=str, nargs="*")
-    parser.add_argument(
+    source_group = parser.add_mutually_exclusive_group()
+    source_group.add_argument("-c", "--clipboard", action="store_true")
+    source_group.add_argument(
         "-f",
         "--file",
         dest="infile",
         type=str,
         help='Input file of text to read. "-" for stdin.',
     )
+    parser.add_argument("text", type=str, nargs="*")
     parser.add_argument("-l", "--loop", action="store_true")
     parser.add_argument("--no-cache", dest="cache", action="store_false")
     parser.add_argument("--clear-cache", action="store_true")
@@ -205,13 +208,15 @@ class Worker(object):
         self.close()
 
 
-def main(infile, loop, text, cache, clear_cache):
+def main(infile, loop, text, cache, clear_cache, clipboard):
     if infile:
         if infile == "-":
             all_text = sys.stdin.read()
         else:
             with open(infile) as f:
                 all_text = f.read()
+    elif clipboard:
+        all_text = pyperclip.paste()
     else:
         all_text = " ".join(text)
 
@@ -245,7 +250,9 @@ def main(infile, loop, text, cache, clear_cache):
         # Shift into positive range
         hex_digits = 8
         stripped_text = "\n".join(l.text for l in lines)
-        curr_hash= int(hashlib.md5(stripped_text.encode()).hexdigest()[:hex_digits], 16)
+        curr_hash = int(
+            hashlib.md5(stripped_text.encode()).hexdigest()[:hex_digits], 16
+        )
         hex_pattern = "{{:0{}x}}".format(hex_digits)
         while True:
             hex_hash = hex_pattern.format(curr_hash)
@@ -253,7 +260,7 @@ def main(infile, loop, text, cache, clear_cache):
                 [CACHE_DIR, CACHE_FILENAME_PATTERN.format(hex_hash)]
             )
             if os.path.exists(cache_path):
-                with open(cache_path, 'r+b') as f:
+                with open(cache_path, "r+b") as f:
                     cached_lines = pickle.load(f)
                     if lines == cached_lines:
                         # Found existing match
@@ -286,4 +293,6 @@ if __name__ == "__main__":
     )
     add_arguments(parser)
     args = parser.parse_args()
+    if args.text and (args.infile or args.clipboard):
+        parser.error("Arguments text, infile, and clipboard are mutually exclusive.")
     sys.exit(main(**args.__dict__))
