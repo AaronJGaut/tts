@@ -18,7 +18,7 @@ import pyperclip
 
 # Removing bad substitution of M. to Monsieur
 gtts.tokenizer.symbols.SUB_PAIRS = []
-CACHE_WARNING_SIZE = 1e9  # 1 GB
+CACHE_WARNING_SIZE = 1e10  # 10 GB
 CACHE_DIR = os.sep.join([os.getenv("HOME", None), ".cache", "tts"])
 CACHE_FILENAME_PATTERN = "tts_cache_{}.pickle"
 
