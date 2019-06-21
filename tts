@@ -51,19 +51,20 @@ def add_arguments(parser):
 
     return parser
 
+class LineStatus(enum.Enum):
+    FREE = enum.auto()
+    DISPATCHED = enum.auto()
+    READY = enum.auto()
+    ERROR = enum.auto()
+
 
 class Line(object):
-    STATUS_FREE = "STATUS_FREE"
-    STATUS_DISPATCHED = "STATUS_DISPATCHED"
-    STATUS_READY = "STATUS_READY"
-    STATUS_ERROR = "STATUS_ERROR"
-
     def __eq__(self, other):
         return self.text == other.text
 
     def __init__(self, text):
         self.text = text.strip()
-        self.status = self.STATUS_FREE
+        self.status = LineStatus.FREE
         self.error = None
         self.mp3bytes = None
 
@@ -71,7 +72,7 @@ class Line(object):
         return hash(self.text)
 
     def play(self):
-        if self.status != self.STATUS_READY:
+        if self.status != LineStatus.READY:
             raise RuntimeError(
                 'Tried to play not ready line "{}" with status "{}"'.format(
                     self.text, self.status
@@ -87,7 +88,7 @@ class Line(object):
 
     def play_fallback(self):
         p = subprocess.Popen(["espeak"], stdin=subprocess.PIPE)
-        p.stdin.write(self.text)
+        p.stdin.write(self.text.encode())
         p.stdin.close()
         p.wait()
 
@@ -98,10 +99,10 @@ class Line(object):
             tts.write_to_fp(data)
             data.seek(0)
             self.mp3bytes = data.getvalue()
-            self.status = self.STATUS_READY
+            self.status = LineStatus.READY
         except Exception as e:
             self.error = e
-            self.status = self.STATUS_ERROR
+            self.status = LineStatus.ERROR
             warnings.warn('Error "{}" when converting line "{}"'.format(e, self.text))
 
 
@@ -147,13 +148,13 @@ class Worker(object):
             if self.__has_been_closed:
                 return
             line = self.__lines[self.__reader_idx]
-            while line.status in [line.STATUS_FREE, line.STATUS_DISPATCHED]:
+            while line.status in [LineStatus.FREE, LineStatus.DISPATCHED]:
                 if self.__has_been_closed:
                     return
                 time.sleep(0.1)
-            if line.status == line.STATUS_READY:
+            if line.status == LineStauts.READY:
                 line.play()
-            elif line.status == line.STATUS_ERROR:
+            elif line.status == LineStatus.ERROR:
                 msg = (
                     'Tried to play line "{}" with status "{}". The error was "{}". '
                     "Falling back to espeak."
@@ -197,8 +198,8 @@ class Worker(object):
                 self.__lines[self.__reader_idx :] + self.__lines[: self.__reader_idx]
             )
             for line in line_order:
-                if line.status == line.STATUS_FREE:
-                    line.status = line.STATUS_DISPATCHED
+                if line.status == LineStatus.FREE:
+                    line.status = LineStatus.DISPATCHED
                     return line
             raise StopIteration
         finally:
@@ -278,8 +279,8 @@ def main(infile, loop, text, cache, clear_cache, clipboard):
     if cache:
         subprocess.call(["mkdir", "-p", CACHE_DIR])
         for line in lines:
-            if line.status != line.STATUS_READY:
-                line.status = line.STATUS_FRESH
+            if line.status != LineStatus.READY:
+                line.status = LineStatus.FREE
             line.error = None
         with open(cache_path, "w+b") as f:
             pickle.dump(lines, f)
