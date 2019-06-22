@@ -19,20 +19,6 @@ import pyperclip
 
 # Removing bad substitution of M. to Monsieur
 gtts.tokenizer.symbols.SUB_PAIRS = []
-CACHE_WARNING_SIZE = 1e10  # 10 GB
-CACHE_DIR = os.sep.join([os.getenv("HOME", None), ".cache", "tts"])
-CACHE_FILENAME_PATTERN = "tts_cache_{}.pickle"
-
-
-def human_filesize(bytes_):
-    units = ["bytes", "kB", "MB", "GB", "TB", "PB"]
-    power = 0
-    for power, unit in enumerate(units):
-        if bytes_ < 1024 ** (power + 1):
-            break
-    if power == 0:
-        return "{} bytes".format(bytes_)
-    return "{:.2f} {}".format(bytes_ / 1024.0 ** power, unit)
 
 
 def add_arguments(parser):
@@ -122,6 +108,96 @@ class Line(object):
             self.error = e
             self.state = LineState.ERROR
             warnings.warn('Error "{}" when converting line "{}"'.format(e, self.text))
+
+    def copy_for_pickling(self):
+        copy = Line(self.text)
+        if self.state == LineState.READY:
+            copy.mp3bytes = self.mp3bytes
+            copy.state = LineState.READY
+        return copy
+
+
+class Lines(object):
+    CACHE_WARNING_SIZE = 1e10  # 10 GB
+    CACHE_DIR = os.sep.join([os.getenv("HOME", None), ".cache", "tts"])
+    CACHE_FILENAME_PATTERN = "tts_cache_{hex_hash}.pickle"
+    CACHE_WRITE_PERIOD = 60  # seconds
+
+    def __init__(self, text, cache=True, clear_cache=False):
+        self.__cache = cache
+        self.__cache_path = None
+        self.__cache_is_stale = False
+        self.__lines = tuple(Line(l) for l in all_text.split("\n") if l.strip())
+        if self.__cache:
+            self.read_cache()
+
+    @classmethod
+    def handle_cache_size(cls, clear_cache):
+        """If clear_cache, deletes all cache entries. Otherwise, print
+        a warning if the overall cache size is too big
+
+        """
+        if os.path.exists(cls.CACHE_DIR):
+            glob_pattern = os.path.sep.join(
+                [cls.CACHE_DIR, cls.CACHE_FILENAME_PATTERN.format(hex_hash="*")]
+            )
+            cache_paths = glob.glob(glob_pattern)
+            if clear_cache:
+                for path in cache_paths:
+                    os.remove(path)
+            else:
+                total_bytes = sum(os.path.getsize(path) for path in cache_paths)
+                if total_bytes > cls.CACHE_WARNING_SIZE:
+                    msg_fmt = (
+                        'Total size of tts cache at path "{}" has size {}, exceeding '
+                        "the warning limit of {}. Run tts --clear-cache to delete all "
+                        "cached files."
+                    )
+                    msg = msg_fmt.format(
+                        cls.CACHE_DIR,
+                        cls.human_filesize(total_bytes),
+                        cls.human_filesize(cls.CACHE_WARNING_SIZE),
+                    )
+                    warnings.warn(msg)
+
+    def read_cache(self):
+        hex_digits = 8
+        stripped_text = "\n".join(l.text for l in self.__lines)
+        curr_hash = int(
+            hashlib.md5(stripped_text.encode()).hexdigest()[:hex_digits], 16
+        )
+        hex_pattern = "{{:0{}x}}".format(hex_digits)
+        while True:
+            hex_hash = hex_pattern.format(curr_hash)
+            self.__cache_path = os.sep.join(
+                [CACHE_DIR, CACHE_FILENAME_PATTERN.format(hex_hash=hex_hash)]
+            )
+            if os.path.exists(self.__cache_path):
+                with open(self.__cache_path, "r+b") as f:
+                    cached_lines = pickle.load(f)
+                    if self.__lines == cached_lines:
+                        # Found existing match
+                        self.__lines = cached_lines
+                        break
+                    else:
+                        # Hash collision
+                        curr_hash += 1
+            else:
+                break
+
+    def write_cache(self):
+
+
+    @staticmethod
+    def human_filesize(bytes_):
+        units = ["bytes", "kB", "MB", "GB", "TB", "PB"]
+        power = 0
+        for power, unit in enumerate(units):
+            if bytes_ < 1024 ** (power + 1):
+                break
+        if power == 0:
+            return "{} bytes".format(bytes_)
+        return "{:.2f} {}".format(bytes_ / 1024.0 ** power, unit)
 
 
 class WorkerState(enum.Enum):
@@ -219,57 +295,6 @@ def main(infile, loop, text, cache, clear_cache, clipboard):
         all_text = pyperclip.paste()
     else:
         all_text = " ".join(text)
-
-    if os.path.exists(CACHE_DIR):
-        glob_pattern = os.path.sep.join([CACHE_DIR, CACHE_FILENAME_PATTERN.format("*")])
-        cache_paths = glob.glob(glob_pattern)
-        if clear_cache:
-            for path in cache_paths:
-                os.remove(path)
-        else:
-            total_bytes = sum(os.path.getsize(path) for path in cache_paths)
-            if total_bytes > CACHE_WARNING_SIZE:
-                msg_fmt = (
-                    'Total size of tts cache at path "{}" has size {}, exceeding '
-                    "the warning limit of {}. Run tts --clear-cache to delete all "
-                    "cached files."
-                )
-                msg = msg_fmt.format(
-                    CACHE_DIR,
-                    human_filesize(total_bytes),
-                    human_filesize(CACHE_WARNING_SIZE),
-                )
-                warnings.warn(msg)
-
-    lines = tuple(Line(l) for l in all_text.split("\n") if l.strip())
-
-    if not lines:
-        return 0
-
-    if cache:
-        hex_digits = 8
-        stripped_text = "\n".join(l.text for l in lines)
-        curr_hash = int(
-            hashlib.md5(stripped_text.encode()).hexdigest()[:hex_digits], 16
-        )
-        hex_pattern = "{{:0{}x}}".format(hex_digits)
-        while True:
-            hex_hash = hex_pattern.format(curr_hash)
-            cache_path = os.sep.join(
-                [CACHE_DIR, CACHE_FILENAME_PATTERN.format(hex_hash)]
-            )
-            if os.path.exists(cache_path):
-                with open(cache_path, "r+b") as f:
-                    cached_lines = pickle.load(f)
-                    if lines == cached_lines:
-                        # Found existing match
-                        lines = cached_lines
-                        break
-                    else:
-                        # Hash collision
-                        curr_hash += 1
-            else:
-                break
 
     reader_idx = 0
     loop = False
