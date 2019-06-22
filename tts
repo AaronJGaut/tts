@@ -144,7 +144,7 @@ class Worker(object):
         self.__runner = threading.Thread(target=self.__run, args=(thread_count,))
         self.__shutdown_flag = False
         self.state = WorkerState.INIT
-        if self.autostart:
+        if autostart:
             self.start()
 
     def start(self):
@@ -194,7 +194,7 @@ class Worker(object):
         finally:
             self.__lock.release()
 
-        line_order = self.__lines[reader_idx:] + list(
+        line_order = self.__lines[reader_idx:] + tuple(
             reversed(self.__lines[:reader_idx])
         )
 
