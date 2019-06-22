@@ -55,7 +55,6 @@ def add_arguments(parser):
 
 class LineState(enum.Enum):
     r"""
-
     FREE --> DISPATCHED --> READY
                         \
                          -> ERROR
@@ -125,27 +124,49 @@ class Line(object):
             warnings.warn('Error "{}" when converting line "{}"'.format(e, self.text))
 
 
+class WorkerState(enum.Enum):
+    r"""
+    INIT --> RUNNING --> DONE --> CLOSED
+
+    """
+    INIT = enum.auto()  # Worker created
+    RUNNING = enum.auto()  # Threads have been started
+    DONE = enum.auto()  # Producer threads have been joined; work is done
+    CLOSED = enum.auto()  # Runner thread is joined; close has been called
+
+
 class Worker(object):
-    def __init__(self, lines, thread_count=3, start_idx=0):
+    def __init__(self, lines, thread_count=3, start_idx=0, autostart=True, cache=True):
         self.__lines = lines
         self.__reader_idx = start_idx
         self.__lock = threading.Lock()
         self.__has_been_closed = False
-        self.__t_producers = []
-        for __ in range(thread_count):
-            t = threading.Thread(target=self.__produce)
-            self.__t_producers.append(t)
+        self.__runner = threading.Thread(target=self.__run, args=(thread_count,))
+        self.__shutdown_flag = False
+        self.state = WorkerState.INIT
+        if self.autostart:
+            self.start()
 
-        for t in self.__t_producers:
+    def start(self):
+        self.__runner.start()
+
+    def __run(self, thread_count):
+        self.state = WorkerState.RUNNING
+        producers = [
+            threading.Thread(target=self.__produce) for __ in range(thread_count)
+        ]
+        for t in producers:
             t.start()
+        for t in producers:
+            t.join()
+        self.state = WorkerState.DONE
 
     def close(self):
-        if self.__has_been_closed:
+        if self.state == WorkerState.CLOSED:
             return
-        self.__has_been_closed = True
-        for t in self.__t_producers:
-            t.join()
-        self.__t_producers = []
+        self.__shutdown_flag = True
+        self.__runner.join()
+        self.state = WorkerState.CLOSED
 
     def __produce(self):
         for line in self:
@@ -164,16 +185,19 @@ class Worker(object):
         return self
 
     def __next__(self):
-        return self.next()
+        if self.__shutdown_flag:
+            raise StopIteration
 
-    def next(self):
         self.__lock.acquire()
         try:
-            line_order = (
-                self.__lines[self.__reader_idx :] + self.__lines[: self.__reader_idx]
-            )
+            reader_idx = self.__reader_idx
         finally:
             self.__lock.release()
+
+        line_order = self.__lines[reader_idx:] + list(
+            reversed(self.__lines[:reader_idx])
+        )
+
         for line in line_order:
             if line.state == LineState.FREE:
                 line.state = LineState.DISPATCHED
@@ -223,7 +247,6 @@ def main(infile, loop, text, cache, clear_cache, clipboard):
         return 0
 
     if cache:
-        # Shift into positive range
         hex_digits = 8
         stripped_text = "\n".join(l.text for l in lines)
         curr_hash = int(
@@ -259,7 +282,7 @@ def main(infile, loop, text, cache, clear_cache, clipboard):
         if line.state in [LineState.READY, LineState.ERROR]:
             line.play()
         else:
-            msg = 'Tried to play line "{}" w/ state "{}". This should never ' "happen."
+            msg = 'Tried to play line "{}" w/ state "{}". This should never happen.'
             raise RuntimeError(msg.format(line.text, line.state))
         reader_idx += 1
         if reader_idx >= len(lines):
