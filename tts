@@ -8,11 +8,11 @@ import tempfile
 import subprocess
 import argparse
 import io
-import warnings
 import threading
 import pickle
 import glob
 import enum
+import logging
 
 import gtts
 import pyperclip
@@ -35,6 +35,12 @@ def add_arguments(parser):
     parser.add_argument("-l", "--loop", action="store_true")
     parser.add_argument("--no-cache", dest="cache", action="store_false")
     parser.add_argument("--clear-cache", action="store_true")
+    parser.add_argument(
+        "-v",
+        "--verbosity",
+        choices=("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"),
+        default="WARNING",
+    )
 
     return parser
 
@@ -52,14 +58,14 @@ class LineState(enum.Enum):
 
 
 class Line(object):
-    def __eq__(self, other):
-        return self.text == other.text
-
     def __init__(self, text):
         self.text = text.strip()
         self.state = LineState.FREE
         self.error = None
         self.mp3bytes = None
+
+    def __eq__(self, other):
+        return self.text == other.text
 
     def __hash__(self):
         return hash(self.text)
@@ -87,10 +93,11 @@ class Line(object):
 
     def __play_espeak_fallback(self):
         msg = (
-            'Tried to play line "{}" with state "{}". The error was "{}". '
+            'Tried to play line "%s" with state "%s". The error was "%s". '
             "Falling back to espeak."
         )
-        warnings.warn(msg.format(self.text, self.state, self.error))
+        logger = logging.getLogger("tts.Line")
+        logger.warning(msg, self.text, str(self.state), str(self.error))
         p = subprocess.Popen(["espeak"], stdin=subprocess.PIPE)
         p.stdin.write(self.text.encode())
         p.stdin.close()
@@ -107,7 +114,8 @@ class Line(object):
         except Exception as e:
             self.error = e
             self.state = LineState.ERROR
-            warnings.warn('Error "{}" when converting line "{}"'.format(e, self.text))
+            logger = logging.getLogger("tts.Line")
+            logger.warning('Error "%s" when converting line "%s"', str(e), self.text)
 
     def copy_for_pickling(self):
         copy = Line(self.text)
@@ -127,9 +135,21 @@ class Lines(object):
         self.__cache = cache
         self.__cache_path = None
         self.__cache_is_stale = False
-        self.__lines = tuple(Line(l) for l in all_text.split("\n") if l.strip())
+        self.__lines = tuple(Line(l) for l in text.split("\n") if l.strip())
+        self.handle_cache_size(clear_cache)
+        self.__logger = logging.getLogger("tts.Lines")
         if self.__cache:
             self.read_cache()
+
+    def finalize(self):
+        if self and self.__cache:
+            self.write_cache()
+
+    def __getitem__(self, idx):
+        return self.__lines[idx]
+
+    def __len__(self):
+        return len(self.__lines)
 
     @classmethod
     def handle_cache_size(cls, clear_cache):
@@ -137,16 +157,20 @@ class Lines(object):
         a warning if the overall cache size is too big
 
         """
+        logger = logging.getLogger("tts.Lines")
         if os.path.exists(cls.CACHE_DIR):
             glob_pattern = os.path.sep.join(
                 [cls.CACHE_DIR, cls.CACHE_FILENAME_PATTERN.format(hex_hash="*")]
             )
             cache_paths = glob.glob(glob_pattern)
             if clear_cache:
+                logger.debug("Clearing cache")
                 for path in cache_paths:
                     os.remove(path)
             else:
                 total_bytes = sum(os.path.getsize(path) for path in cache_paths)
+                total_bytes_string = cls.human_filesize(total_bytes)
+                logger.info("Total cache size: %s", total_bytes_string)
                 if total_bytes > cls.CACHE_WARNING_SIZE:
                     msg_fmt = (
                         'Total size of tts cache at path "{}" has size {}, exceeding '
@@ -155,12 +179,13 @@ class Lines(object):
                     )
                     msg = msg_fmt.format(
                         cls.CACHE_DIR,
-                        cls.human_filesize(total_bytes),
+                        total_bytes_string,
                         cls.human_filesize(cls.CACHE_WARNING_SIZE),
                     )
-                    warnings.warn(msg)
+                    logger.warning(msg)
 
     def read_cache(self):
+        self.__logger.debug("looking for cache to read")
         hex_digits = 8
         stripped_text = "\n".join(l.text for l in self.__lines)
         curr_hash = int(
@@ -170,7 +195,7 @@ class Lines(object):
         while True:
             hex_hash = hex_pattern.format(curr_hash)
             self.__cache_path = os.sep.join(
-                [CACHE_DIR, CACHE_FILENAME_PATTERN.format(hex_hash=hex_hash)]
+                [self.CACHE_DIR, self.CACHE_FILENAME_PATTERN.format(hex_hash=hex_hash)]
             )
             if os.path.exists(self.__cache_path):
                 with open(self.__cache_path, "r+b") as f:
@@ -178,15 +203,29 @@ class Lines(object):
                     if self.__lines == cached_lines:
                         # Found existing match
                         self.__lines = cached_lines
+                        self.__logger.debug("using existing cache %s", self.__cache_path)
                         break
                     else:
                         # Hash collision
                         curr_hash += 1
+                        self.__logger.debug("cache hash collision with %s", self.__cache_path)
             else:
+                self.__logger.debug("using new cache location %s", self.__cache_path)
                 break
 
     def write_cache(self):
-
+        self.__logger.debug("Writing cache")
+        subprocess.call(["mkdir", "-p", self.CACHE_DIR])
+        for line in self.__lines:
+            if line.state != LineState.READY:
+                line.state = LineState.FREE
+            line.error = None
+        # Atomic write
+        pickle_path = self.__cache_path + ".part"
+        with open(pickle_path, "w+b") as f:
+            pickle.dump(self.__lines, f)
+        os.rename(pickle_path, self.__cache_path)
+        self.__logger.debug("Done writing cache")
 
     @staticmethod
     def human_filesize(bytes_):
@@ -219,6 +258,7 @@ class Worker(object):
         self.__has_been_closed = False
         self.__runner = threading.Thread(target=self.__run, args=(thread_count,))
         self.__shutdown_flag = False
+        self.__logger = logging.getLogger("tts.Worker")
         self.state = WorkerState.INIT
         if autostart:
             self.start()
@@ -227,6 +267,7 @@ class Worker(object):
         self.__runner.start()
 
     def __run(self, thread_count):
+        self.__logger.debug("Starting runner thread")
         self.state = WorkerState.RUNNING
         producers = [
             threading.Thread(target=self.__produce) for __ in range(thread_count)
@@ -235,25 +276,34 @@ class Worker(object):
             t.start()
         for t in producers:
             t.join()
+        self.__logger.debug("Done joining producers")
+        self.__lines.finalize()
         self.state = WorkerState.DONE
+        self.__logger.debug("Leaving runner thread")
 
     def close(self):
         if self.state == WorkerState.CLOSED:
+            self.__logger.debug("Worker was already closed")
             return
+        self.__logger.debug("Closing worker")
         self.__shutdown_flag = True
         self.__runner.join()
         self.state = WorkerState.CLOSED
+        self.__logger.debug("Worker has been closed")
 
     def __produce(self):
+        self.__logger.debug("Starting producer thread")
         for line in self:
             if self.__has_been_closed:
                 return
             line.convert()
+        self.__logger.debug("Leaving producer thread")
 
     def set_reader_index(self, idx):
         self.__lock.acquire()
         try:
             self.__reader_idx = idx
+            self.__logger.debug("reader_idx updated to %d", self.__reader_idx)
         finally:
             self.__lock.release()
 
@@ -284,7 +334,42 @@ class Worker(object):
         self.close()
 
 
-def main(infile, loop, text, cache, clear_cache, clipboard):
+class SequentialReader(object):
+    def __init__(self, lines, worker, start_idx=0, loop=False, autostart=True):
+        self.__lines = lines
+        self.__worker = worker
+        self.__reader_idx = start_idx
+        self.__loop = loop
+        self.__worker.set_reader_index(self.__reader_idx)
+        self.__logger = logging.getLogger("tts.Reader")
+        if autostart:
+            self.start()
+
+    def start(self):
+        if not self.__lines:
+            return
+        while True:
+            line = self.__lines[self.__reader_idx]
+            while line.state in [LineState.FREE, LineState.DISPATCHED]:
+                time.sleep(0.1)
+            if line.state in [LineState.READY, LineState.ERROR]:
+                line.play()
+            else:
+                msg = 'Tried to play line "{}" w/ state "{}". This should never happen.'
+                raise RuntimeError(msg.format(line.text, line.state))
+            self.__reader_idx += 1
+            if self.__reader_idx >= len(self.__lines):
+                if self.__loop:
+                    self.__reader_idx = self.__reader_idx % len(self.__lines)
+                else:
+                    break
+            self.__worker.set_reader_index(self.__reader_idx)
+
+
+def main(infile, loop, text, cache, clear_cache, clipboard, verbosity):
+    logging.basicConfig(level=verbosity)
+    logger = logging.getLogger("tts.main")
+
     if infile:
         if infile == "-":
             all_text = sys.stdin.read()
@@ -296,38 +381,21 @@ def main(infile, loop, text, cache, clear_cache, clipboard):
     else:
         all_text = " ".join(text)
 
+    lines = Lines(all_text, cache=cache, clear_cache=clear_cache)
+
     reader_idx = 0
-    loop = False
-    worker = Worker(lines, start_idx=reader_idx)
+    worker = Worker(lines)
 
-    while True:
-        line = lines[reader_idx]
-        while line.state in [LineState.FREE, LineState.DISPATCHED]:
-            time.sleep(0.1)
-        if line.state in [LineState.READY, LineState.ERROR]:
-            line.play()
-        else:
-            msg = 'Tried to play line "{}" w/ state "{}". This should never happen.'
-            raise RuntimeError(msg.format(line.text, line.state))
-        reader_idx += 1
-        if reader_idx >= len(lines):
-            if loop:
-                reader_idx = reader_idx % len(lines)
-            else:
-                break
-        worker.set_reader_index(reader_idx)
+    try:
+        reader = SequentialReader(lines, worker, start_idx=reader_idx, loop=loop)
+    except KeyboardInterrupt:
+        logger.debug("Caught keyboard interrupt")
+        print("Shutting down...")
+    finally:
+        logger.debug("Calling worker.close")
+        worker.close()
 
-    worker.close()
-
-    if cache:
-        subprocess.call(["mkdir", "-p", CACHE_DIR])
-        for line in lines:
-            if line.state != LineState.READY:
-                line.state = LineState.FREE
-            line.error = None
-        with open(cache_path, "w+b") as f:
-            pickle.dump(lines, f)
-
+    logger.debug("Exiting")
     return 0
 
 
