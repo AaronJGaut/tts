@@ -35,6 +35,7 @@ def add_arguments(parser):
     parser.add_argument("-l", "--loop", action="store_true")
     parser.add_argument("--no-cache", dest="cache", action="store_false")
     parser.add_argument("--clear-cache", action="store_true")
+    parser.add_argument("-s", "--start-line", type=int, default=0)
     parser.add_argument(
         "-v",
         "--verbosity",
@@ -350,6 +351,7 @@ class SequentialReader(object):
             return
         while True:
             line = self.__lines[self.__reader_idx]
+            self.__logger.info("Starting line %d", self.__reader_idx)
             while line.state in [LineState.FREE, LineState.DISPATCHED]:
                 time.sleep(0.1)
             if line.state in [LineState.READY, LineState.ERROR]:
@@ -366,7 +368,7 @@ class SequentialReader(object):
             self.__worker.set_reader_index(self.__reader_idx)
 
 
-def main(infile, loop, text, cache, clear_cache, clipboard, verbosity):
+def main(infile, loop, text, cache, clear_cache, clipboard, verbosity, start_line):
     logging.basicConfig(level=verbosity)
     logger = logging.getLogger("tts.main")
 
@@ -383,13 +385,12 @@ def main(infile, loop, text, cache, clear_cache, clipboard, verbosity):
 
     lines = Lines(all_text, cache=cache, clear_cache=clear_cache)
 
-    reader_idx = 0
     worker = Worker(lines)
 
     try:
-        reader = SequentialReader(lines, worker, start_idx=reader_idx, loop=loop)
+        reader = SequentialReader(lines, worker, start_idx=start_line, loop=loop)
     except KeyboardInterrupt:
-        logger.debug("Caught keyboard interrupt")
+        logger.info("Caught keyboard interrupt")
         print("Shutting down...")
     finally:
         logger.debug("Calling worker.close")
